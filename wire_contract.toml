@@ -1,0 +1,51 @@
+# The wire contract between exec-mcp and the build driver that calls it.
+#
+# `run_task` returns text whose first line is a header the driver parses:
+#
+#     {prefix} {task_name}: {short}
+#
+# Both sides assert against this file: tests/test_wire_contract.py here for
+# the producer, the driver's own contract test for the consumer. It ships
+# beside the server so the contract travels with the image.
+#
+# `inconclusive` is the driver's classification: a non-zero exit is a verdict,
+# a timeout is not. Two consecutive inconclusive outcomes force `task_blocked`;
+# any completion, failure included, resets the count.
+
+version = 1
+
+[[case]]
+status = "finished"
+prefix = "[task done]"
+short = "ok"
+inconclusive = false
+note = "the command ran and exited 0"
+
+[[case]]
+status = "failed"
+prefix = "[task done]"
+short = "exit {returncode}"
+inconclusive = false
+note = "the command ran and exited non-zero - a real result, not inconclusive"
+
+[[case]]
+status = "timeout"
+prefix = "[task timeout]"
+short = "timed out at {timeout_s}s"
+inconclusive = true
+note = "exec-mcp's own flag was set before it signalled - a budget statement"
+
+[[case]]
+status = "killed"
+prefix = "[task killed]"
+short = "killed by {signal_name}"
+inconclusive = true
+note = "died without that flag - almost always the OOM killer"
+
+[[case]]
+status = "missing"
+prefix = "[task done]"
+short = "{output}"
+inconclusive = false
+note = """The binary is not installed; `short` carries the spawn error, which is \
+what names the missing command. Not inconclusive: retrying cannot help."""

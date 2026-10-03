@@ -1,0 +1,21 @@
+[project]
+name = "exec-mcp"
+version = "0.1.0"
+description = "Runs a task's named build and test commands and commits the result"
+requires-python = ">=3.14"
+license = "MIT"
+dependencies = [
+    # The server uses the mcp 2.x API.
+    "mcp[cli]>=2,<3",
+
+    # Imported directly for the SSE transport.
+    "starlette",
+    "uvicorn",
+]
+
+[project.optional-dependencies]
+# Test dependencies.
+dev = [
+    "pytest",
+    "pytest-asyncio",
+]
