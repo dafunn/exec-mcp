@@ -34,6 +34,15 @@ RUN set -eux; apt-get update; \
 
 Build the image locally.
 
+The server reports its release in the MCP `initialize` result
+(`serverInfo.version`). To stamp it, build from a checkout with tags:
+
+```
+docker build --build-arg EXEC_MCP_VERSION=$(git describe --tags --match 'exec-mcp-v*' | sed 's/^exec-mcp-v//') .
+```
+
+A build without it reports `dev`.
+
 Three rules for deriving:
 
 - **Do not override `CMD`, `ENTRYPOINT`, `WORKDIR` or `USER`.** The launcher

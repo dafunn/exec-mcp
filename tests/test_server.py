@@ -9,6 +9,8 @@ import os
 import subprocess
 
 import pytest
+from mcp import Client
+from mcp.server.mcpserver.exceptions import ToolError
 
 import proc
 import server
@@ -26,12 +28,13 @@ async def test_a_clean_run_logs_ok_not_finished(rig):
 
 
 async def test_an_unknown_repo_is_denied_not_a_traceback(rig):
-    result = await server.run_task(repo="../escape", name="ok")
-    assert result.startswith("[denied]")
+    with pytest.raises(ToolError, match=r"^\[denied\]"):
+        await server.run_task(repo="../escape", name="ok")
 
 
 async def test_git_add_outside_the_repo_is_logged_as_failed(rig):
-    await server.git_add(repo="demo", paths=["../../outside"])
+    with pytest.raises(ToolError, match=r"^\[denied\]"):
+        await server.git_add(repo="demo", paths=["../../outside"])
     records = _lines(rig)
     assert records[-1]["kind"] == "git"
     assert records[-1]["outcome"] == "failed"
@@ -105,10 +108,11 @@ def test_task_output_searches(tmp_path, monkeypatch):
 
 def test_task_output_refuses_a_run_id_that_walks_out(tmp_path, monkeypatch):
     _run_log(tmp_path, monkeypatch, ["x"])
-    out = asyncio.run(server.task_output("../../etc/passwd"))
-    assert out.startswith("[denied]")
-    out = asyncio.run(server.task_output("nope"))
-    assert out.startswith("[denied]") and "demo" in out  # names what does exist
+    with pytest.raises(ToolError, match=r"^\[denied\]"):
+        asyncio.run(server.task_output("../../etc/passwd"))
+    with pytest.raises(ToolError, match=r"^\[denied\]") as exc:
+        asyncio.run(server.task_output("nope"))
+    assert "demo" in str(exc.value)  # names what does exist
 
 
 def test_task_output_caps_a_huge_range_and_says_how_to_continue(tmp_path, monkeypatch):
@@ -147,13 +151,13 @@ def test_spilled_logs_are_pruned_by_total_size(tmp_path, monkeypatch):
 
 
 def test_a_path_shaped_repo_argument_is_diagnosed_not_denied_as_absent():
-    out = server._deny_repo("src/widget")
+    out = str(server._deny_repo("src/widget"))
     assert "looks like a path" in out
     assert "'widget'" in out  # names the form that would work
 
 
 def test_an_unknown_repo_still_reads_as_unknown():
-    out = server._deny_repo("nope")
+    out = str(server._deny_repo("nope"))
     assert "is not a write repo" in out
     assert "looks like a path" not in out
 
@@ -189,5 +193,60 @@ def test_task_output_defaults_to_the_most_recent_run(tmp_path, monkeypatch):
 
 def test_task_output_with_no_runs_at_all_says_so(tmp_path, monkeypatch):
     monkeypatch.setattr(server, "RUN_LOGS", tmp_path)
-    out = asyncio.run(server.task_output())
-    assert out.startswith("[denied]") and "no task has been run yet" in out
+    with pytest.raises(ToolError, match=r"^\[denied\] no task has been run yet"):
+        asyncio.run(server.task_output())
+
+
+# -- what a client receives -----------------------------------------------
+
+
+async def _call(name: str, args: dict):
+    async with Client(server.mcp) as client:
+        return await client.call_tool(name, args)
+
+
+@pytest.mark.parametrize("name, args, reason", [
+    ("list_tasks", {"repo": "nope"}, "is not a write repo"),
+    ("run_task", {"repo": "demo", "name": "missing"}, "'missing' is not a task for 'demo'"),
+    ("git_status", {"repo": "src/demo"}, "looks like a path"),
+    ("task_output", {"run_id": "../../etc/passwd"}, "is not a run id"),
+])
+async def test_a_denial_reaches_the_client_as_an_error_result(rig, name, args, reason):
+    result = await _call(name, args)
+    assert result.is_error is True
+    text = result.content[0].text
+    assert "[denied]" in text and reason in text
+
+
+async def test_a_denial_is_logged_without_a_traceback(rig, caplog):
+    with caplog.at_level("DEBUG"):
+        await _call("list_tasks", {"repo": "nope"})
+    assert not [r for r in caplog.records if r.levelname == "ERROR" or r.exc_info]
+
+
+async def test_a_normal_result_is_not_an_error(rig):
+    result = await _call("list_tasks", {"repo": "demo"})
+    assert not result.is_error
+    assert "ok:" in result.content[0].text
+
+
+# -- Release version ------------------------------------------------
+
+
+def test_release_version_is_dev_when_unset(monkeypatch):
+    monkeypatch.delenv("EXEC_MCP_VERSION", raising=False)
+    assert server.release_version() == "dev"
+
+
+def test_release_version_is_dev_when_blank(monkeypatch):
+    monkeypatch.setenv("EXEC_MCP_VERSION", "  ")
+    assert server.release_version() == "dev"
+
+
+def test_release_version_reports_the_build_value(monkeypatch):
+    monkeypatch.setenv("EXEC_MCP_VERSION", "0.2.0-3-gabc1234")
+    assert server.release_version() == "0.2.0-3-gabc1234"
+
+
+def test_server_reports_the_release_version():
+    assert server.mcp.version == server.release_version()

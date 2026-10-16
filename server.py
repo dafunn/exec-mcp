@@ -15,6 +15,7 @@ import time
 from pathlib import Path
 
 from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 from starlette.responses import PlainTextResponse
 
 import git_tools
@@ -43,17 +44,25 @@ MAX_MATCHES = 200
 _lock = asyncio.Lock()
 _log = InvocationLog(LOG_PATH)
 
+
+def release_version() -> str:
+    """The release this build reports to clients: EXEC_MCP_VERSION,
+    stamped into the image from the exec-mcp-v* tag at build time, else `dev`."""
+    return os.environ.get("EXEC_MCP_VERSION", "").strip() or "dev"
+
+
 # mcp 2.x: host/port belong to the transport runner, not the constructor.
 # `main` passes them, so a stdio run does not have to carry them.
-mcp = MCPServer("exec-mcp")
+mcp = MCPServer("exec-mcp", version=release_version())
 
 
-def _deny(why: str) -> str:
-    """A refusal: what was refused, why, and what to do instead."""
-    return f"[denied] {why}"
+def _deny(why: str) -> ToolError:
+    """A refusal: what was refused, why, and what to do instead. Callers raise
+    it, so the client gets it as an error result, not as output."""
+    return ToolError(f"[denied] {why}")
 
 
-def _deny_repo(repo: str) -> str:
+def _deny_repo(repo: str) -> ToolError:
     """Name the actual mistake: a path-shaped argument, or an unknown repo."""
     try:
         known = sorted(p.name for p in (WORKSPACE / "src").iterdir() if p.is_dir())
@@ -104,7 +113,7 @@ async def list_tasks(repo: str) -> str:
             tools take.
     """
     if _repo_root(repo) is None:
-        return _deny_repo(repo)
+        raise _deny_repo(repo)
     tasks = _manifest_for(repo)
     if not tasks:
         return f"no tasks declared for {repo!r}."
@@ -170,12 +179,12 @@ async def run_task(repo: str, name: str) -> str:
     """
     root = _repo_root(repo)
     if root is None:
-        return _deny_repo(repo)
+        raise _deny_repo(repo)
     tasks = _manifest_for(repo)
     cmd = tasks.get(name)
     if cmd is None:
         available = ", ".join(sorted(tasks)) or "(none declared)"
-        return _deny(f"{name!r} is not a task for {repo!r}. Available: {available}.")
+        raise _deny(f"{name!r} is not a task for {repo!r}. Available: {available}.")
 
     run_id = f"{repo}-{name}-{int(time.time() * 1000)}"
     async with _lock:
@@ -269,23 +278,23 @@ async def task_output(
     if not run_id:
         run_id = _latest_run()
         if not run_id:
-            return _deny("no task has been run yet, so there is no output to read.")
+            raise _deny("no task has been run yet, so there is no output to read.")
     if not _RUN_ID.match(run_id):
-        return _deny(f"{run_id!r} is not a run id. Known runs: {', '.join(_known_runs()) or '(none)'}.")
+        raise _deny(f"{run_id!r} is not a run id. Known runs: {', '.join(_known_runs()) or '(none)'}.")
     log = RUN_LOGS / f"{run_id}.log"
     if not log.is_file():
-        return _deny(f"no output kept for {run_id!r}. Known runs: {', '.join(_known_runs()) or '(none)'}.")
+        raise _deny(f"no output kept for {run_id!r}. Known runs: {', '.join(_known_runs()) or '(none)'}.")
 
     try:
         lines = log.read_text(errors="replace").splitlines()
     except OSError as exc:
-        return _deny(f"could not read the log for {run_id!r}: {exc}")
+        raise _deny(f"could not read the log for {run_id!r}: {exc}") from exc
 
     if pattern:
         try:
             rx = re.compile(pattern)
         except re.error as exc:
-            return _deny(f"{pattern!r} is not a valid regex: {exc}")
+            raise _deny(f"{pattern!r} is not a valid regex: {exc}") from exc
         hits = [(n, ln) for n, ln in enumerate(lines, 1) if rx.search(ln)]
         if not hits:
             return f"no lines match {pattern!r} in {run_id} ({len(lines)} lines)."
@@ -321,12 +330,11 @@ async def task_output(
     return body
 
 
-def _git_repo(repo: str) -> Path | str:
-    """A repo root, or a ready-to-return denial string - callers check
-    `isinstance(result, str)`."""
+def _git_repo(repo: str) -> Path:
+    """A repo root; an unknown repo is refused."""
     root = _repo_root(repo)
     if root is None:
-        return _deny_repo(repo)
+        raise _deny_repo(repo)
     return root
 
 
@@ -336,7 +344,7 @@ async def _run_git(repo: str, op: str, summary: str, coro) -> str:
         result = await coro
     except git_tools.GitToolError as e:
         _log.git(repo, op, summary, "failed", time.monotonic() - start)
-        return _deny(str(e))
+        raise _deny(str(e)) from e
     _log.git(repo, op, summary, "ok", time.monotonic() - start)
     return result
 
@@ -345,8 +353,6 @@ async def _run_git(repo: str, op: str, summary: str, coro) -> str:
 async def git_status(repo: str) -> str:
     """Show `git status --short` for `repo`."""
     root = _git_repo(repo)
-    if isinstance(root, str):
-        return root
     async with _lock:
         return await _run_git(repo, "status", "", git_tools.git_status(root))
 
@@ -355,8 +361,6 @@ async def git_status(repo: str) -> str:
 async def git_diff(repo: str, staged: bool = False) -> str:
     """Show a diff for `repo` - unstaged by default, staged on request."""
     root = _git_repo(repo)
-    if isinstance(root, str):
-        return root
     async with _lock:
         return await _run_git(
             repo, "diff", f"staged={staged}", git_tools.git_diff(root, staged=staged)
@@ -372,8 +376,6 @@ async def git_add(repo: str, paths: list[str]) -> str:
         paths: relative to the repo root; each is confined under it.
     """
     root = _git_repo(repo)
-    if isinstance(root, str):
-        return root
     async with _lock:
         return await _run_git(
             repo, "add", ", ".join(paths), git_tools.git_add(root, paths)
@@ -384,8 +386,6 @@ async def git_add(repo: str, paths: list[str]) -> str:
 async def git_commit(repo: str, message: str) -> str:
     """Commit staged changes in `repo` with `message`."""
     root = _git_repo(repo)
-    if isinstance(root, str):
-        return root
     async with _lock:
         return await _run_git(
             repo, "commit", message, git_tools.git_commit(root, message)
@@ -396,8 +396,6 @@ async def git_commit(repo: str, message: str) -> str:
 async def git_log(repo: str, n: int = 10) -> str:
     """Show the last `n` commits in `repo`, oneline."""
     root = _git_repo(repo)
-    if isinstance(root, str):
-        return root
     async with _lock:
         return await _run_git(repo, "log", f"n={n}", git_tools.git_log(root, n=n))
 
